@@ -299,6 +299,14 @@ async function runCampaign(
         receipt.outputDir === selectedArtifactOutput) &&
       (await hasArtifacts(artifactOutput))
     ) {
+      if (receipt.status !== "failed") {
+        // Completed tasks do not enter a worker, so retry any checkout cleanup
+        // that may have failed after their receipt was recorded.
+        await rm(join(output, "checkouts", task.id), {
+          recursive: true,
+          force: true,
+        }).catch(() => undefined);
+      }
       if (receipt.status !== "failed" && receipt.warnings?.length) {
         warnings.push({ repository: task.id, warnings: receipt.warnings });
         for (const warning of receipt.warnings) {
@@ -370,6 +378,7 @@ async function runCampaign(
         let protectedRoot = join(output, "checkouts", task.id);
         let attemptedResume = false;
         let failure: string | undefined;
+        let cleanupFailure: string | undefined;
         const runWarnings: string[] = [];
         let attemptPolicyFailed: boolean | undefined;
         let cost: Readonly<ScanCost> | null = null;
@@ -524,9 +533,21 @@ async function runCampaign(
             : errorMessage(error);
         } finally {
           if (options.recoverScan === undefined && checkout !== undefined) {
-            await rm(checkout, { recursive: true, force: true });
+            cleanupFailure = await rm(checkout, {
+              recursive: true,
+              force: true,
+            }).then(
+              () => undefined,
+              (error: unknown) =>
+                `Multiscan checkout cleanup failed: ${errorMessage(error)}`,
+            );
           }
         }
+        const reportedErrors = [failure, cleanupFailure].filter(
+          (message): message is string => message !== undefined,
+        );
+        const reportedError =
+          reportedErrors.length === 0 ? undefined : reportedErrors.join("; ");
         const status = failure !== undefined ? "failed" : "completed";
         if (threatModelPath === undefined)
           threatModelPath = await readThreatModelPath(scanDir, {
@@ -543,7 +564,7 @@ async function runCampaign(
             outputDir: scanDir,
             ...(threatModelPath === null ? {} : { threatModelPath }),
             ...(cost === null ? {} : { cost }),
-            ...(failure === undefined ? {} : { error: failure }),
+            ...(reportedError === undefined ? {} : { error: reportedError }),
             ...(knowledgeBaseFailure ? { knowledgeBaseFailure: true } : {}),
             ...(runWarnings.length === 0 ? {} : { warnings: runWarnings }),
             policyFailed: attemptPolicyFailed,
@@ -560,7 +581,7 @@ async function runCampaign(
           repository: task.id,
           attempt,
           status,
-          ...(failure === undefined ? {} : { error: failure }),
+          ...(reportedError === undefined ? {} : { error: reportedError }),
         });
         if (failure === undefined) {
           policyFailed ||= attemptPolicyFailed === true;
