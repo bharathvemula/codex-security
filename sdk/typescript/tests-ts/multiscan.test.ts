@@ -1586,6 +1586,76 @@ describe("multiscan", () => {
     },
   );
 
+  test("records a recovered scan outcome when recovery checkout cleanup fails", async () => {
+    const { paths } = await repositoryFixture("recovery-cleanup", "stubborn");
+    await runMultiscan(
+      options(paths, client(rejecting("Interrupted scan")), { maxAttempts: 1 }),
+    );
+    const checkout = join(
+      paths.output,
+      "recovery-checkouts",
+      "stubborn",
+      "attempt-2",
+    );
+    const originalRm = filesystem.rm;
+    let scanned = false;
+    let rejectedCleanup = false;
+    const removeSpy = spyOn(filesystem, "rm").mockImplementation(
+      async (...args: Parameters<typeof originalRm>) => {
+        if (scanned && !rejectedCleanup && String(args[0]) === checkout) {
+          rejectedCleanup = true;
+          throw Object.assign(
+            new Error(`EBUSY: resource busy, rm '${checkout}'`),
+            { code: "EBUSY" },
+          );
+        }
+        return await Reflect.apply(originalRm, filesystem, args);
+      },
+    );
+    const run = mock<SecurityClient["run"]>(
+      async (_repository, scanOptions = {}) => {
+        const result = await completedScan(scanOptions.outputDir!);
+        scanned = true;
+        return result;
+      },
+    );
+    const progress: Array<
+      Parameters<NonNullable<MultiscanOptions["onProgress"]>>[0]
+    > = [];
+    const configured = options(paths, client(run), {
+      maxAttempts: 1,
+      recoverScan: async () => undefined,
+      onProgress: (event) => progress.push(event),
+    });
+
+    try {
+      const summary = await runMultiscan(configured);
+      expect(summary).toMatchObject({ completed: 1, failed: 0, skipped: 0 });
+      expect(progress.at(-1)).toMatchObject({
+        repository: "stubborn",
+        attempt: 2,
+        status: "completed",
+        error: expect.stringContaining("Multiscan checkout cleanup failed"),
+      });
+      expect((await results(summary.resultsPath)).at(-1)).toMatchObject({
+        status: "completed",
+        attempt: 2,
+        error: expect.stringContaining("EBUSY"),
+      });
+      expect((await lstat(checkout)).isDirectory()).toBe(true);
+
+      expect(await runMultiscan(configured)).toMatchObject({
+        completed: 1,
+        failed: 0,
+        skipped: 1,
+      });
+      expect(run).toHaveBeenCalledTimes(1);
+      await expect(lstat(checkout)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      removeSpy.mockRestore();
+    }
+  });
+
   test("limits simultaneous checkouts to the requested worker count", async () => {
     const paths = await fixture();
     const knowledgeBasePaths = [

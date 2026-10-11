@@ -301,11 +301,22 @@ async function runCampaign(
     ) {
       if (receipt.status !== "failed") {
         // Completed tasks do not enter a worker, so retry any checkout cleanup
-        // that may have failed after their receipt was recorded.
-        await rm(join(output, "checkouts", task.id), {
-          recursive: true,
-          force: true,
-        }).catch(() => undefined);
+        // that was reported with their receipt.
+        await Promise.all(
+          [
+            join(output, "checkouts", task.id),
+            join(
+              output,
+              "recovery-checkouts",
+              task.id,
+              `attempt-${receipt.attempt}`,
+            ),
+          ].map((checkout) =>
+            rm(checkout, { recursive: true, force: true }).catch(
+              () => undefined,
+            ),
+          ),
+        );
       }
       if (receipt.status !== "failed" && receipt.warnings?.length) {
         warnings.push({ repository: task.id, warnings: receipt.warnings });
@@ -386,6 +397,7 @@ async function runCampaign(
         let exhaustedBudget = false;
         let requiresRecovery = false;
         let knowledgeBaseFailure = false;
+        let attemptCompleted = false;
         try {
           await ensureOutputDirectory(artifactRoot);
           let result:
@@ -521,6 +533,7 @@ async function runCampaign(
           }
           if (result.manifest.scan.status !== "completed")
             throw new Error(`Multiscan scan ${result.manifest.scan.status}.`);
+          attemptCompleted = true;
         } catch (error) {
           if (options.signal?.aborted === true) options.signal.throwIfAborted();
           if (error instanceof ScanCostLimitExceededError) {
@@ -532,7 +545,10 @@ async function runCampaign(
             ? `Bulk attempt directory is not empty: ${scanDir}. Existing artifacts and checkout were preserved. Run the same bulk-scan command with --recover to recover interrupted scans or retry failed scans in new attempt directories.`
             : errorMessage(error);
         } finally {
-          if (options.recoverScan === undefined && checkout !== undefined) {
+          if (
+            checkout !== undefined &&
+            (options.recoverScan === undefined || attemptCompleted)
+          ) {
             cleanupFailure = await rm(checkout, {
               recursive: true,
               force: true,
@@ -570,13 +586,6 @@ async function runCampaign(
             policyFailed: attemptPolicyFailed,
           })}\n`,
         );
-        if (
-          options.recoverScan !== undefined &&
-          failure === undefined &&
-          checkout !== undefined
-        ) {
-          await rm(checkout, { recursive: true, force: true });
-        }
         notifyProgress(options, {
           repository: task.id,
           attempt,
