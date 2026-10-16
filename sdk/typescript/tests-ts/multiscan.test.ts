@@ -20,7 +20,7 @@ import {
 } from "node:fs/promises";
 import * as filesystem from "node:fs/promises";
 import { hostname } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, spyOn, test, mock } from "bun:test";
 import { main } from "../src/cli.js";
@@ -1655,6 +1655,87 @@ describe("multiscan", () => {
       removeSpy.mockRestore();
     }
   });
+
+  test("retries failed scans and continues later tasks when checkout cleanup fails", async () => {
+    const { paths, source } = await repositoryFixture("cleanup-retry", "retry");
+    await appendFile(paths.input, `next,${source.path},${source.revision}\n`);
+    const checkout = join(paths.output, "checkouts", "retry");
+    const originalRm = filesystem.rm;
+    let attempted = false;
+    let rejectedCleanup = false;
+    const removeSpy = spyOn(filesystem, "rm").mockImplementation(
+      async (...args: Parameters<typeof originalRm>) => {
+        if (attempted && !rejectedCleanup && String(args[0]) === checkout) {
+          rejectedCleanup = true;
+          throw new Error("EACCES: synthetic cleanup failure");
+        }
+        return await Reflect.apply(originalRm, filesystem, args);
+      },
+    );
+    const run = mock<SecurityClient["run"]>(
+      async (_repository, scanOptions = {}) => {
+        if (!attempted) {
+          attempted = true;
+          throw new Error("ORIGINAL_SCAN_FAILURE");
+        }
+        return await completedScan(scanOptions.outputDir!);
+      },
+    );
+
+    try {
+      const summary = await runMultiscan(options(paths, client(run)));
+
+      expect(summary).toMatchObject({ total: 2, completed: 2, failed: 0 });
+      expect(run).toHaveBeenCalledTimes(3);
+      expect(await results(summary.resultsPath)).toMatchObject([
+        {
+          id: "retry",
+          status: "failed",
+          attempt: 1,
+          error:
+            "ORIGINAL_SCAN_FAILURE; Multiscan checkout cleanup failed: EACCES: synthetic cleanup failure",
+        },
+        { id: "retry", status: "completed", attempt: 2 },
+        { id: "next", status: "completed", attempt: 1 },
+      ]);
+    } finally {
+      removeSpy.mockRestore();
+    }
+  });
+
+  test.each(["root", "task"] as const)(
+    "preserves completed scans and external files when the recovery checkout %s is linked",
+    async (parent) => {
+      const { paths } = await repositoryFixture("linked-cleanup", "done");
+      const scans = mock(completeRun);
+      const configured = options(paths, client(scans));
+      await runMultiscan(configured);
+      const recoveryRoot = join(paths.output, "recovery-checkouts");
+      const external = await temporaryDirectory();
+      const preserved = join(
+        external,
+        ...(parent === "root" ? ["done"] : []),
+        "attempt-1",
+        "keep.txt",
+      );
+      await mkdir(dirname(preserved), { recursive: true });
+      await writeFile(preserved, "preserved\n");
+      if (parent === "task") await mkdir(recoveryRoot, { mode: 0o700 });
+      await symlink(
+        external,
+        parent === "root" ? recoveryRoot : join(recoveryRoot, "done"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      expect(await runMultiscan(configured)).toMatchObject({
+        completed: 1,
+        failed: 0,
+        skipped: 1,
+      });
+      expect(scans).toHaveBeenCalledTimes(1);
+      expect(await readFile(preserved, "utf8")).toBe("preserved\n");
+    },
+  );
 
   test("limits simultaneous checkouts to the requested worker count", async () => {
     const paths = await fixture();

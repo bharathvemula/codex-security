@@ -300,23 +300,22 @@ async function runCampaign(
       (await hasArtifacts(artifactOutput))
     ) {
       if (receipt.status !== "failed") {
-        // Completed tasks do not enter a worker, so retry any checkout cleanup
-        // that was reported with their receipt.
-        await Promise.all(
-          [
-            join(output, "checkouts", task.id),
-            join(
-              output,
-              "recovery-checkouts",
-              task.id,
-              `attempt-${receipt.attempt}`,
-            ),
-          ].map((checkout) =>
-            rm(checkout, { recursive: true, force: true }).catch(
-              () => undefined,
-            ),
-          ),
-        );
+        await rm(join(output, "checkouts", task.id), {
+          recursive: true,
+          force: true,
+        }).catch(() => undefined);
+        try {
+          const recoveryRoot = join(output, "recovery-checkouts");
+          await lstat(recoveryRoot);
+          await ensureOutputDirectory(recoveryRoot);
+          const taskRoot = join(recoveryRoot, task.id);
+          await lstat(taskRoot);
+          await ensureOutputDirectory(taskRoot);
+          await rm(join(taskRoot, `attempt-${receipt.attempt}`), {
+            recursive: true,
+            force: true,
+          });
+        } catch {}
       }
       if (receipt.status !== "failed" && receipt.warnings?.length) {
         warnings.push({ repository: task.id, warnings: receipt.warnings });
