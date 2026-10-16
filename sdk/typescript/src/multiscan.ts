@@ -590,12 +590,6 @@ async function runCampaign(
         await appendReceipt(ledger, `${JSON.stringify(receipt)}\n`);
         if (recoveryCheckout !== undefined) {
           reportedError = await removeCheckout(recoveryCheckout);
-          if (reportedError !== undefined) {
-            await appendReceipt(
-              ledger,
-              `${JSON.stringify({ ...receipt, error: reportedError })}\n`,
-            ).catch(() => undefined);
-          }
         }
         notifyProgress(options, {
           repository: task.id,

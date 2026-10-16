@@ -1615,8 +1615,12 @@ describe("multiscan", () => {
     },
   );
 
-  test("records a recovered scan outcome when recovery checkout cleanup fails", async () => {
-    const { paths } = await repositoryFixture("recovery-cleanup", "stubborn");
+  test("keeps recovery receipts readable and continues after checkout cleanup fails", async () => {
+    const { paths, source } = await repositoryFixture(
+      "recovery-cleanup",
+      "stubborn",
+    );
+    await appendFile(paths.input, `next,${source.path},${source.revision}\n`);
     await runMultiscan(
       options(paths, client(rejecting("Interrupted scan")), { maxAttempts: 1 }),
     );
@@ -1627,6 +1631,30 @@ describe("multiscan", () => {
       "attempt-2",
     );
     const originalRm = filesystem.rm;
+    const originalOpen = filesystem.open;
+    let diagnosticWrites = 0;
+    const openSpy = spyOn(filesystem, "open").mockImplementation(
+      async (...args: Parameters<typeof originalOpen>) => {
+        const file = await Reflect.apply(originalOpen, filesystem, args);
+        if (String(args[0]) === join(paths.output, "results.jsonl")) {
+          const write = file.writeFile.bind(file);
+          file.writeFile = async (data, options) => {
+            const text = String(data);
+            if (
+              JSON.parse(text).error?.includes(
+                "Multiscan checkout cleanup failed",
+              )
+            ) {
+              diagnosticWrites += 1;
+              await write(text.slice(0, 24), options);
+              throw new Error("EIO: synthetic partial diagnostic write");
+            }
+            return await write(data, options);
+          };
+        }
+        return file;
+      },
+    );
     let scanned = false;
     let rejectedCleanup = false;
     const removeSpy = spyOn(filesystem, "rm").mockImplementation(
@@ -1659,30 +1687,46 @@ describe("multiscan", () => {
 
     try {
       const summary = await runMultiscan(configured);
-      expect(summary).toMatchObject({ completed: 1, failed: 0, skipped: 0 });
-      expect(progress.at(-1)).toMatchObject({
+      expect(summary).toMatchObject({ completed: 2, failed: 0, skipped: 0 });
+      expect(
+        progress.find(
+          (event) =>
+            event.repository === "stubborn" && event.status === "completed",
+        ),
+      ).toMatchObject({
         repository: "stubborn",
         attempt: 2,
         status: "completed",
         error: expect.stringContaining("Multiscan checkout cleanup failed"),
       });
-      expect((await results(summary.resultsPath)).at(-1)).toMatchObject({
+      const receipts = await results(summary.resultsPath);
+      const recovered = receipts.find(
+        (receipt) =>
+          receipt["id"] === "stubborn" && receipt["status"] === "completed",
+      );
+      expect(recovered).toMatchObject({
         status: "completed",
         attempt: 2,
-        error: expect.stringContaining("EBUSY"),
         cleanupPending: "recovery-checkout",
       });
+      expect(recovered).not.toHaveProperty("error");
+      expect(receipts.at(-1)).toMatchObject({
+        id: "next",
+        status: "completed",
+      });
+      expect(diagnosticWrites).toBe(0);
       expect((await lstat(checkout)).isDirectory()).toBe(true);
 
-      expect(await runMultiscan(configured)).toMatchObject({
-        completed: 1,
+      expect(await runMultiscan(options(paths, client(run)))).toMatchObject({
+        completed: 2,
         failed: 0,
-        skipped: 1,
+        skipped: 2,
       });
-      expect(run).toHaveBeenCalledTimes(1);
+      expect(run).toHaveBeenCalledTimes(2);
       await expect(lstat(checkout)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       removeSpy.mockRestore();
+      openSpy.mockRestore();
     }
   });
 
