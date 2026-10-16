@@ -1686,6 +1686,52 @@ describe("multiscan", () => {
     }
   });
 
+  test("reuses recovered completion saved before checkout removal", async () => {
+    const { paths } = await repositoryFixture("cleanup-interruption", "done");
+    await runMultiscan(
+      options(paths, client(rejecting("Interrupted scan")), { maxAttempts: 1 }),
+    );
+    const checkout = join(
+      paths.output,
+      "recovery-checkouts",
+      "done",
+      "attempt-2",
+    );
+    const ledger = join(paths.output, "results.jsonl");
+    const originalRm = filesystem.rm;
+    let persistedBeforeRemoval: string | undefined;
+    const removeSpy = spyOn(filesystem, "rm").mockImplementation(
+      async (...args: Parameters<typeof originalRm>) => {
+        if (String(args[0]) === checkout) {
+          persistedBeforeRemoval = await readFile(ledger, "utf8");
+        }
+        return await Reflect.apply(originalRm, filesystem, args);
+      },
+    );
+    const run = mock(completeRun);
+    try {
+      await runMultiscan(
+        options(paths, client(run), { recoverScan: async () => undefined }),
+      );
+    } finally {
+      removeSpy.mockRestore();
+    }
+
+    expect(persistedBeforeRemoval).toBeDefined();
+    await writeFile(ledger, persistedBeforeRemoval!);
+    expect((await results(ledger)).at(-1)).toMatchObject({
+      status: "completed",
+      attempt: 2,
+      cleanupPending: "recovery-checkout",
+    });
+    expect(await runMultiscan(options(paths, client(run)))).toMatchObject({
+      completed: 1,
+      failed: 0,
+      skipped: 1,
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
   test("retries failed scans and continues later tasks when checkout cleanup fails", async () => {
     const { paths, source } = await repositoryFixture("cleanup-retry", "retry");
     await appendFile(paths.input, `next,${source.path},${source.revision}\n`);
