@@ -551,12 +551,11 @@ describe("multiscan", () => {
       );
       return completedScan(scan.outputDir!);
     });
-    const result = await runMultiscan(
-      options(paths, client(runs), {
-        maxAttempts: 1,
-        recoverScan: resumed,
-      }),
-    );
+    const configured = options(paths, client(runs), {
+      maxAttempts: 1,
+      recoverScan: resumed,
+    });
+    const result = await runMultiscan(configured);
     expect(result).toMatchObject({
       completed: 2,
       failed: 0,
@@ -579,6 +578,17 @@ describe("multiscan", () => {
       attempt: 6,
       status: "completed",
     });
+    expect(await runMultiscan(configured)).toMatchObject({
+      completed: 2,
+      failed: 0,
+      skipped: 2,
+    });
+    expect(runs).toHaveBeenCalledTimes(1);
+    expect(resumed).toHaveBeenCalledTimes(1);
+    expect((await lstat(checkout)).ino).toBe(inode);
+    expect(await readFile(join(checkout, "source"), "utf8")).toBe(
+      "keep checkout",
+    );
   });
 
   test.each([false, true])(
@@ -737,6 +747,22 @@ describe("multiscan", () => {
         status: failure ? "failed" : "completed",
       });
       expect(await readFile(join(dir, "checkpoint"), "utf8")).toBe("keep");
+      if (!failure) {
+        expect(
+          await runMultiscan(
+            options(paths, client(runs), {
+              maxAttempts: 3,
+              config: { pythonPath: PYTHON },
+              recoverScan,
+            }),
+          ),
+        ).toMatchObject({ completed: 1, failed: 0, skipped: 1 });
+        expect(recoverScan).toHaveBeenCalledTimes(1);
+        expect(runs).not.toHaveBeenCalled();
+        expect(await readFile(join(checkout, "source"), "utf8")).toBe(
+          "keep checkout",
+        );
+      }
     },
   );
 
@@ -1568,6 +1594,9 @@ describe("multiscan", () => {
         const receipts = await results(summary.resultsPath);
         expect(receipts).toHaveLength(1);
         expect(receipts[0]).toMatchObject({ status: outcome });
+        expect(receipts[0]?.["cleanupPending"]).toBe(
+          outcome === "completed" ? "checkout" : undefined,
+        );
         const error = String(receipts[0]?.["error"]);
         expect(error).toContain("Multiscan checkout cleanup failed");
         if (outcome === "failed") {
@@ -1641,6 +1670,7 @@ describe("multiscan", () => {
         status: "completed",
         attempt: 2,
         error: expect.stringContaining("EBUSY"),
+        cleanupPending: "recovery-checkout",
       });
       expect((await lstat(checkout)).isDirectory()).toBe(true);
 
@@ -1710,6 +1740,12 @@ describe("multiscan", () => {
       const scans = mock(completeRun);
       const configured = options(paths, client(scans));
       await runMultiscan(configured);
+      const ledger = join(paths.output, "results.jsonl");
+      const [receipt] = await results(ledger);
+      await writeFile(
+        ledger,
+        `${JSON.stringify({ ...receipt, cleanupPending: "recovery-checkout" })}\n`,
+      );
       const recoveryRoot = join(paths.output, "recovery-checkouts");
       const external = await temporaryDirectory();
       const preserved = join(
@@ -1736,6 +1772,40 @@ describe("multiscan", () => {
       expect(await readFile(preserved, "utf8")).toBe("preserved\n");
     },
   );
+
+  test("preserves sibling artifacts when a cleanup receipt has a traversal attempt", async () => {
+    const { paths } = await repositoryFixture("cleanup-traversal", "done");
+    const scans = mock(completeRun);
+    const configured = options(paths, client(scans));
+    await runMultiscan(configured);
+    const external = join(paths.root, "other-scan");
+    await completedScan(external);
+    const preserved = join(external, "keep.txt");
+    await writeFile(preserved, "preserved\n");
+    await mkdir(join(paths.output, "recovery-checkouts", "done"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const ledger = join(paths.output, "results.jsonl");
+    const [receipt] = await results(ledger);
+    await writeFile(
+      ledger,
+      `${JSON.stringify({
+        ...receipt,
+        attempt: "1/../../../../other-scan",
+        outputDir: external,
+        cleanupPending: "recovery-checkout",
+      })}\n`,
+    );
+
+    expect(await runMultiscan(configured)).toMatchObject({
+      completed: 1,
+      failed: 0,
+      skipped: 1,
+    });
+    expect(scans).toHaveBeenCalledTimes(1);
+    expect(await readFile(preserved, "utf8")).toBe("preserved\n");
+  });
 
   test("limits simultaneous checkouts to the requested worker count", async () => {
     const paths = await fixture();

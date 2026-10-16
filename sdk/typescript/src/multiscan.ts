@@ -73,6 +73,7 @@ interface MultiscanReceipt extends MultiscanTask {
   warnings?: string[];
   policyFailed?: boolean;
   knowledgeBaseFailure?: true;
+  cleanupPending?: "checkout" | "recovery-checkout";
 }
 
 interface MultiscanHistory {
@@ -299,22 +300,29 @@ async function runCampaign(
         receipt.outputDir === selectedArtifactOutput) &&
       (await hasArtifacts(artifactOutput))
     ) {
-      if (receipt.status !== "failed") {
-        await rm(join(output, "checkouts", task.id), {
-          recursive: true,
-          force: true,
-        }).catch(() => undefined);
+      if (
+        receipt.status === "completed" &&
+        Number.isSafeInteger(receipt.attempt) &&
+        receipt.attempt > 0
+      ) {
         try {
-          const recoveryRoot = join(output, "recovery-checkouts");
-          await lstat(recoveryRoot);
-          await ensureOutputDirectory(recoveryRoot);
-          const taskRoot = join(recoveryRoot, task.id);
-          await lstat(taskRoot);
-          await ensureOutputDirectory(taskRoot);
-          await rm(join(taskRoot, `attempt-${receipt.attempt}`), {
-            recursive: true,
-            force: true,
-          });
+          if (receipt.cleanupPending === "checkout") {
+            await rm(join(output, "checkouts", task.id), {
+              recursive: true,
+              force: true,
+            });
+          } else if (receipt.cleanupPending === "recovery-checkout") {
+            const recoveryRoot = join(output, "recovery-checkouts");
+            await lstat(recoveryRoot);
+            await ensureOutputDirectory(recoveryRoot);
+            const taskRoot = join(recoveryRoot, task.id);
+            await lstat(taskRoot);
+            await ensureOutputDirectory(taskRoot);
+            await rm(join(taskRoot, `attempt-${receipt.attempt}`), {
+              recursive: true,
+              force: true,
+            });
+          }
         } catch {}
       }
       if (receipt.status !== "failed" && receipt.warnings?.length) {
@@ -580,6 +588,14 @@ async function runCampaign(
             ...(threatModelPath === null ? {} : { threatModelPath }),
             ...(cost === null ? {} : { cost }),
             ...(reportedError === undefined ? {} : { error: reportedError }),
+            ...(failure === undefined && cleanupFailure !== undefined
+              ? {
+                  cleanupPending:
+                    options.recoverScan === undefined
+                      ? "checkout"
+                      : "recovery-checkout",
+                }
+              : {}),
             ...(knowledgeBaseFailure ? { knowledgeBaseFailure: true } : {}),
             ...(runWarnings.length === 0 ? {} : { warnings: runWarnings }),
             policyFailed: attemptPolicyFailed,
